@@ -316,15 +316,48 @@ def main():
         # Visualization
         if args.debug >= 1:
             center_pose = pose @ np.linalg.inv(to_origin)
-            vis = draw_posed_3d_box(reader.K, img=color, ob_in_cam=center_pose, bbox=bbox)
-            vis = draw_xyz_axis(color, ob_in_cam=center_pose, scale=0.1, K=reader.K,
-                                thickness=3, transparency=0, is_input_rgb=True)
+
+            # RGB overlay (for preview window and video_frames)
+            vis_rgb = draw_posed_3d_box(reader.K, img=color.copy(), ob_in_cam=center_pose, bbox=bbox)
+            vis_rgb = draw_xyz_axis(vis_rgb, ob_in_cam=center_pose, scale=0.1, K=reader.K,
+                                    thickness=3, transparency=0, is_input_rgb=True)
+
             if args.debug == 1:
-                cv2.imshow(f'FP [{args.camera}]', vis[..., ::-1])
+                cv2.imshow(f'FP [{args.camera}]', vis_rgb[..., ::-1])
                 if cv2.waitKey(1) == ord('q'):
                     break
+
             elif args.debug >= 2:
-                imageio.imwrite(os.path.join(debug_dir, 'track_vis', f'{reader.id_strs[i]}.png'), vis)
+                # Black-background tracking visualization with rendered mesh
+                # 1) Render the object mesh at estimated pose
+                #    nvdiffrast requires H/W divisible by 8; pad then crop
+                H8 = (reader.H + 7) // 8 * 8
+                W8 = (reader.W + 7) // 8 * 8
+                K8 = reader.K.copy()
+                K8[0] *= W8 / reader.W
+                K8[1] *= H8 / reader.H
+
+                ob_in_cam_t = torch.as_tensor(pose, device='cuda', dtype=torch.float).reshape(1, 4, 4)
+                rendered, _, _ = nvdiffrast_render(
+                    K=K8, H=H8, W=W8,
+                    ob_in_cams=ob_in_cam_t, glctx=est.glctx,
+                    mesh_tensors=est.mesh_tensors, mesh=mesh,
+                )
+                rendered_np = (rendered[0].data.cpu().numpy() * 255).astype(np.uint8)
+                rendered_np = rendered_np[:reader.H, :reader.W, :3].copy()  # crop back, RGB
+
+                # 2) Draw 3D box + XYZ axis on top
+                vis_track = draw_posed_3d_box(reader.K, img=rendered_np, ob_in_cam=center_pose, bbox=bbox)
+                vis_track = draw_xyz_axis(vis_track, ob_in_cam=center_pose, scale=0.1, K=reader.K,
+                                          thickness=3, transparency=0, is_input_rgb=True)
+                imageio.imwrite(os.path.join(debug_dir, 'track_vis', f'{reader.id_strs[i]}.png'), vis_track)
+
+                # 3) RGB overlay (video_frames)
+                vis_rgb_mesh = draw_posed_3d_box(reader.K, img=color.copy(), ob_in_cam=center_pose, bbox=bbox)
+                vis_rgb_mesh = draw_xyz_axis(vis_rgb_mesh, ob_in_cam=center_pose, scale=0.1, K=reader.K,
+                                             thickness=3, transparency=0, is_input_rgb=True)
+                os.makedirs(os.path.join(debug_dir, 'video_frames'), exist_ok=True)
+                imageio.imwrite(os.path.join(debug_dir, 'video_frames', f'{reader.id_strs[i]}.png'), vis_rgb_mesh)
 
     logging.info(f"[{args.camera}] Done → {debug_dir}/ob_in_cam/")
 
