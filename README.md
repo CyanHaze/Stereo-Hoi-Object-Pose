@@ -200,6 +200,7 @@ data/<clip>/foundationpose_v2/
 | `scripts/run_demo_save_depth.py` | FFS 单帧推理 (被 run_ffs_batch 调用) | conda ffs |
 | `scripts/convert_depth_npy_to_png.py` | depth npy → uint16 PNG 转换 | 任意 Python |
 | `scripts/build_comparison_video.py` | 渲染+合成对比视频 | 任意 Python② |
+| `scripts/run_wilor_hand.py` | WiLoR 批量手部 mesh 推理 | conda diffusion |
 
 > ① `--vis` 需要 FP Docker
 > ② `render` 模式需 `trimesh`(可选，AABB fallback)；`compose` 模式需 `ffmpeg`
