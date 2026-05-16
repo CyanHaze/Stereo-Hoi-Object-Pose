@@ -136,6 +136,32 @@ python scripts/run_fusion.py --clip clip03 --method left_main --smooth 5 --vis
 
 输出 → `foundationpose_v2/fused/ob_in_cam/*.txt` (+ `track_vis/` + `video_frames/` 当 `--vis`)
 
+### Step 5: 生成对比视频
+
+**推荐在 FP Docker 容器内运行**（可同时渲染 + 合成；容器外只能合成已有帧）。
+
+```bash
+# 全流程：渲染缺失帧 + 合成 MP4 + 左右并排对比
+python scripts/build_comparison_video.py --clip clip03
+
+# 仅合成（不渲染，video_frames 已就绪时使用）
+python scripts/build_comparison_video.py --clip clip03 --mode compose
+
+# 仅渲染缺失帧
+python scripts/build_comparison_video.py --clip clip03 --mode render
+
+# 指定帧范围 / 帧率
+python scripts/build_comparison_video.py --clip clip03 --start_frame 0 --end_frame 100 --fps 15
+```
+
+输出视频：
+| 文件 | 内容 |
+|---|---|
+| `run/track.mp4` | 左视角 tracking 结果叠加 RGB |
+| `run_right/track.mp4` | 右视角 tracking 结果叠加 RGB |
+| `fused/track.mp4` | 融合后位姿叠加 RGB |
+| `comparison_left_fused.mp4` | 左右并排（left-only \| fused） |
+
 ## 输出结构
 
 ```
@@ -143,12 +169,16 @@ data/<clip>/foundationpose_v2/
 ├── run/                     # 左视角 tracking
 │   ├── ob_in_cam/*.txt      # 4x4 位姿矩阵 (左相机坐标系, 米)
 │   ├── track_vis/*.png      # mesh 渲染视图
-│   └── video_frames/*.png   # RGB 叠加视图
+│   ├── video_frames/*.png   # RGB 叠加视图
+│   └── track.mp4            # RGB 叠加视频
 ├── run_right/               # 右视角 tracking (结构同上)
-└── fused/                   # 融合结果
-    ├── ob_in_cam/*.txt      # 4x4 位姿矩阵 (左相机坐标系)
-    ├── track_vis/*.png      # (需 --vis)
-    └── video_frames/*.png   # (需 --vis)
+│   └── track.mp4
+├── fused/                   # 融合结果
+│   ├── ob_in_cam/*.txt      # 4x4 位姿矩阵 (左相机坐标系)
+│   ├── track_vis/*.png      # (需 --vis)
+│   ├── video_frames/*.png   # (需 --vis)
+│   └── track.mp4            # 融合位姿视频
+└── comparison_left_fused.mp4  # 左右并排对比 (left | fused)
 ```
 
 ## 脚本
@@ -160,8 +190,10 @@ data/<clip>/foundationpose_v2/
 | `scripts/run_fusion.py` | 左右 pose 多视角融合 | 任意 Python① |
 | `scripts/run_demo_save_depth.py` | FFS 单帧推理 (被 run_ffs_batch 调用) | conda ffs |
 | `scripts/convert_depth_npy_to_png.py` | depth npy → uint16 PNG 转换 | 任意 Python |
+| `scripts/build_comparison_video.py` | 渲染+合成对比视频 | 任意 Python② |
 
 > ① `--vis` 需要 FP Docker
+> ② `render` 模式需 `trimesh`(可选，AABB fallback)；`compose` 模式需 `ffmpeg`
 
 ## 参考
 
