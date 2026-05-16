@@ -9,6 +9,7 @@
 | 环境 | 用途 |
 |------|------|
 | `conda activate ffs` | Fast-FoundationStereo 深度推理 |
+| `conda activate diffusion` | WiLoR 手部 mesh 推理 + HOI 可视化 |
 | FoundationPose Docker 容器 | FoundationPose tracking + 融合可视化 (`--vis`) |
 
 > 纯融合（不加 `--vis`）不需要 Docker，任意有 numpy+scipy 的 Python 环境均可。
@@ -36,6 +37,8 @@ data/<clip>/
 - 相机坐标系：OpenCV/ZED 约定（+X 右、+Y 下、+Z 前）
 - 双目已 rectified，`K_left == K_right`，畸变全 0
 - `calib.json::baseline_m` ≈ 6.3 cm，右相机在左相机 +X 方向
+- WiLoR 预训练模型放在 `WiLoR/pretrained_models/` 下（detector.pt + wilor_final.ckpt）
+- MANO 手部模型 `MANO_RIGHT.pkl` 放在 `WiLoR/mano_data/` 下（需从 mano.is.tue.mpg.de 手动下载）
 
 ### calib.json
 
@@ -54,10 +57,17 @@ data/<clip>/
 
 ```
 双目视频
-  → [1] run_ffs_batch.py  → ffs/depth/ (左视图深度, uint16 mm)
-  → [2] run_fp_track.py --camera left   → foundationpose_v2/run/ob_in_cam/*.txt
-  → [3] run_fp_track.py --camera right  → foundationpose_v2/run_right/ob_in_cam/*.txt
-  → [4] run_fusion.py   → foundationpose_v2/fused/ob_in_cam/*.txt
+  ├── 物体位姿 ─────────────────────────────────────
+  │ → [1] run_ffs_batch.py  → ffs/depth/ (左视图深度, uint16 mm)
+  │ → [2] run_fp_track.py --camera left   → foundationpose_v2/run/ob_in_cam/*.txt
+  │ → [3] run_fp_track.py --camera right  → foundationpose_v2/run_right/ob_in_cam/*.txt
+  │ → [4] run_fusion.py   → foundationpose_v2/fused/ob_in_cam/*.txt
+  │
+  ├── 手部 mesh ────────────────────────────────────
+  │ → [5] run_wilor_hand.py --camera left   → wilor/left/*.npz
+  │
+  └── 手物可视化 ───────────────────────────────────
+      → [6] render_hoi.py  → hoi/video_frames/*.png
 ```
 
 ### Step 1: 双目深度
@@ -171,6 +181,51 @@ python scripts/build_comparison_video.py --clip clip03 --start_frame 0 --end_fra
 | `fused/track.mp4` | 融合后位姿叠加 RGB |
 | `comparison_left_fused.mp4` | 左右并排（left-only \| fused） |
 
+### Step 6: WiLoR 手部 mesh 推理
+
+**需要先准备好 WiLoR 环境**（`conda activate diffusion`，依赖见 `WiLoR/requirements.txt`）。
+
+```bash
+conda activate diffusion
+cd F:/Research/02_Projects/SRTP/Reproduction/WiLoR
+
+# 测试前 10 帧（保存手部 mesh 叠加图）
+python ./scripts/run_wilor_hand.py --clip clip03 --camera left --end_frame 10 --debug
+
+# 全序列
+python ./scripts/run_wilor_hand.py --clip clip03 --camera left --debug
+```
+
+每帧输出 `data/<clip>/wilor/left/<frame>.npz`，包含：
+
+| 字段 | 形状 | 说明 |
+|------|------|------|
+| `verts_mano` | (N, 778, 3) | MANO 手部 mesh 顶点（米） |
+| `verts_virt` | (N, 778, 3) | WiLoR 虚拟相机坐标（用于渲染） |
+| `verts_cam` | (N, 778, 3) | metric 相机坐标（深度对齐后） |
+| `joints` / `joints_2d` | (N, 21, 3) / (N, 21, 2) | 3D/2D 手部关节 |
+| `wrist_3d` | (N, 3) | metric 手腕位置（相机坐标系，米） |
+| `depth_ok` | (N,) | 深度对齐是否成功 |
+
+### Step 7: 手+物合并渲染
+
+**前置**：需先跑完 Step 2/4（物体 pose）和 Step 6（手部数据）。
+
+```bash
+conda activate diffusion
+cd F:/Research/02_Projects/SRTP/Reproduction
+
+# 测试前 10 帧
+python scripts/render_hoi.py --clip clip03 --end_frame 10
+
+# 全序列 + 合成 MP4
+python scripts/render_hoi.py --clip clip03 --fps 30
+```
+
+输出 `data/<clip>/hoi/video_frames/*.png`（`--fps N` 时同时生成 `track.mp4`）。
+
+渲染内容：右手（橙）、左手（青）、物体 mesh（绿半透明）、物体 3D bbox（绿线框）、手腕标记点（红点）。
+
 ## 输出结构
 
 ```
@@ -188,6 +243,14 @@ data/<clip>/foundationpose_v2/
 │   ├── video_frames/*.png   # (需 --vis)
 │   └── track.mp4            # 融合位姿视频
 └── comparison_left_fused.mp4  # 左右并排对比 (left | fused)
+
+data/<clip>/wilor/
+├── left/                            # 左手视角手部数据
+│   └── *.npz                        # 每帧手部 mesh + 关节 + metric 位置
+└── video_frames/                    # 手部 mesh 叠加图 (--debug)
+
+data/<clip>/hoi/
+└── video_frames/                    # 手+物合并渲染帧 (*.png)
 ```
 
 ## 脚本
@@ -200,12 +263,33 @@ data/<clip>/foundationpose_v2/
 | `scripts/run_demo_save_depth.py` | FFS 单帧推理 (被 run_ffs_batch 调用) | conda ffs |
 | `scripts/convert_depth_npy_to_png.py` | depth npy → uint16 PNG 转换 | 任意 Python |
 | `scripts/build_comparison_video.py` | 渲染+合成对比视频 | 任意 Python② |
-| `scripts/run_wilor_hand.py` | WiLoR 批量手部 mesh 推理 | conda diffusion |
+| `scripts/run_wilor_hand.py` | WiLoR 批量手部 mesh 推理 + metric 对齐 | conda diffusion |
+| `scripts/render_hoi.py` | 手+物合并渲染（mesh + bbox 叠加） | conda diffusion |
 
 > ① `--vis` 需要 FP Docker
 > ② `render` 模式需 `trimesh`(可选，AABB fallback)；`compose` 模式需 `ffmpeg`
+
+## 安装依赖
+
+### conda diffusion 环境（WiLoR 手部推理 + HOI 可视化）
+
+```bash
+conda activate diffusion
+pip install smplx==0.1.28 pytorch-lightning timm einops xtcocotools \
+    hydra-core hydra-submitit-launcher hydra-colorlog pyrootutils rich \
+    webdataset yacs scikit-image pyrender gradio ultralytics==8.1.34
+pip install --no-build-isolation "chumpy @ git+https://github.com/mattloper/chumpy"
+```
+
+### MANO 模型（手动下载）
+
+1. 注册 [mano.is.tue.mpg.de](https://mano.is.tue.mpg.de)
+2. 下载 `mano_v*_*.zip`，解压得到 `MANO_RIGHT.pkl`
+3. 放到 `WiLoR/mano_data/MANO_RIGHT.pkl`
 
 ## 参考
 
 - [Fast-FoundationStereo](https://github.com/NVlabs/FoundationStereo)
 - [FoundationPose](https://github.com/NVlabs/FoundationPose)
+- [WiLoR](https://github.com/rolpotamias/WiLoR) — End-to-end 3D hand localization and reconstruction (CVPR 2025)
+- [MANO](https://mano.is.tue.mpg.de) — Hand model
