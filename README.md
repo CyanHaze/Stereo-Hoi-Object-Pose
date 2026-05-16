@@ -81,6 +81,7 @@ python scripts/run_ffs_batch.py --clip clip03 --overwrite
 ### Step 2: FoundationPose 左视角 tracking
 
 ```bash
+docker exec -it foundationpose bash
 # FoundationPose Docker 容器内
 cd /mnt/f/Research/02_Projects/SRTP/Reproduction
 
