@@ -187,14 +187,22 @@ python scripts/build_comparison_video.py --clip clip03 --start_frame 0 --end_fra
 
 ```bash
 conda activate diffusion
-cd F:/Research/02_Projects/SRTP/Reproduction/WiLoR
+cd F:/Research/02_Projects/SRTP/Reproduction
 
 # 测试前 10 帧（保存手部 mesh 叠加图）
-python ./scripts/run_wilor_hand.py --clip clip03 --camera left --end_frame 10 --debug
+python scripts/run_wilor_hand.py --clip clip03 --camera left --end_frame 10 --debug
 
 # 全序列
-python ./scripts/run_wilor_hand.py --clip clip03 --camera left --debug
+python scripts/run_wilor_hand.py --clip clip03 --camera left --debug
+
+# 手部筛选参数（过滤误检为人手的脸部等）
+python scripts/run_wilor_hand.py --clip clip03 --camera left --max_hands 2 --hand_top_margin 0.12
 ```
+
+| `--max_hands` | 默认 | 说明 |
+|---|---|---|
+| `--max_hands 2` | 2 | 每帧最多保留的手部检测数。按左右手分组，每组取最高置信度；超过时取置信度前 N |
+| `--hand_top_margin 0.12` | 0.12 | 位置过滤：丢弃 bbox 中心在图像高度前 12% 的检测（通常为脸部误检）；设 0 关闭 |
 
 每帧输出 `data/<clip>/wilor/left/<frame>.npz`，包含：
 
@@ -225,6 +233,27 @@ python scripts/render_hoi.py --clip clip03 --fps 30
 输出 `data/<clip>/hoi/video_frames/*.png`（`--fps N` 时同时生成 `track.mp4`）。
 
 渲染内容：右手（橙）、左手（青）、物体 mesh（绿半透明）、物体 3D bbox（绿线框）、手腕标记点（红点）。
+
+### Step 8: 交互式 3D 浏览
+
+**前置**：需先跑完 Step 2/4（物体 pose）和 Step 6/7（手部数据）。需要 `viser` 包（`pip install viser`）。
+
+```bash
+conda activate diffusion
+cd F:/Research/02_Projects/SRTP/Reproduction
+
+# 启动 Viser 服务器，浏览器中自由旋转/缩放/平移视角
+python scripts/hoi_viewer.py --clip clip03
+
+# 自定义端口、播放速度
+python scripts/hoi_viewer.py --clip clip03 --port 8081 --fps 15
+```
+
+打开浏览器访问 `http://localhost:8080` 即可交互查看。
+
+**场景内容**：物体 mesh（绿半透明）、物体 3D bbox（绿线框）、左手 mesh（橙）、右手 mesh（青）、手腕标记点（红）、相机原点坐标轴、参考网格。
+
+**操作**：鼠标左键旋转、右键平移、滚轮缩放；下方面板控制播放/暂停、帧滑块、各元素显隐与透明度。
 
 ## 输出结构
 
@@ -265,6 +294,7 @@ data/<clip>/hoi/
 | `scripts/build_comparison_video.py` | 渲染+合成对比视频 | 任意 Python② |
 | `scripts/run_wilor_hand.py` | WiLoR 批量手部 mesh 推理 + metric 对齐 | conda diffusion |
 | `scripts/render_hoi.py` | 手+物合并渲染（mesh + bbox 叠加） | conda diffusion |
+| `scripts/hoi_viewer.py` | Viser 交互式 3D 浏览器（自由视角） | conda diffusion |
 
 > ① `--vis` 需要 FP Docker
 > ② `render` 模式需 `trimesh`(可选，AABB fallback)；`compose` 模式需 `ffmpeg`

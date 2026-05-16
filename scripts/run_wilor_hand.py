@@ -174,6 +174,101 @@ def render_mesh_overlay(img_bgr, verts_cam, faces, K, color=(200, 180, 220), alp
 
 
 # ---------------------------------------------------------------------------
+# Hand detection filter — keep only the main two hands, reject faces
+# ---------------------------------------------------------------------------
+
+def filter_hand_detections(bboxes, is_right_list, img_h, img_w,
+                           max_hands=2, top_margin_ratio=0.12):
+    """Filter YOLO hand detections to keep only the main two hands.
+
+    Faces are often mis-detected as hands.  In typical HOI video the camera
+    looks slightly downward at a table-top scene: hands appear in the lower
+    half of the frame while a face would be in the upper portion.
+
+    Strategy:
+      1. Position filter — discard detections centred too high in the image
+         (likely faces / false positives).
+      2. Group by left / right hand type.
+      3. Keep only the highest-confidence detection per hand type.
+      4. If more than max_hands remain, keep top by confidence.
+
+    Returns:
+        filtered_bboxes, filtered_is_right, n_filtered
+    """
+    if len(bboxes) == 0:
+        return bboxes, is_right_list, 0
+
+    n_original = len(bboxes)
+
+    # ---- step 1: positional filter (reject face-like high detections) ----
+    pos_keep = []
+    pos_drop = 0
+    y_thresh = img_h * top_margin_ratio
+    for idx, bbox in enumerate(bboxes):
+        center_y = (bbox[1] + bbox[3]) / 2.0  # (y1 + y2) / 2
+        if center_y > y_thresh:
+            pos_keep.append(idx)
+        else:
+            pos_drop += 1
+
+    # Safety: if every detection is above the margin don't drop everything
+    if len(pos_keep) == 0:
+        pos_keep = list(range(n_original))
+        pos_drop = 0
+
+    if pos_drop > 0:
+        logging.info(f"  [filter] position drop: {pos_drop} det(s) above "
+                     f"{top_margin_ratio*100:.0f}% of image height")
+
+    # Trim to position survivors
+    bboxes = [bboxes[i] for i in pos_keep]
+    is_right_list = [is_right_list[i] for i in pos_keep]
+
+    # ---- step 2: group by left / right, keep best per group ----
+    def _conf(bbox):
+        return float(bbox[4])  # YOLO format: [x1,y1,x2,y2,conf]
+
+    entries = list(zip(bboxes, is_right_list))
+    entries.sort(key=lambda e: _conf(e[0]), reverse=True)
+
+    best_left = None   # (bbox, is_right) for is_right==0
+    best_right = None  # (bbox, is_right) for is_right==1
+    for bbox, is_r in entries:
+        if is_r == 0 and best_left is None:
+            best_left = (bbox, is_r)
+        elif is_r == 1 and best_right is None:
+            best_right = (bbox, is_r)
+        if best_left is not None and best_right is not None:
+            break
+
+    # ---- step 3: assemble result ----
+    selected = []
+    if best_left is not None:
+        selected.append(best_left)
+    if best_right is not None:
+        selected.append(best_right)
+
+    # If we still exceed max_hands, trim by confidence
+    if len(selected) > max_hands:
+        selected.sort(key=lambda e: _conf(e[0]), reverse=True)
+        selected = selected[:max_hands]
+
+    # Sort left-first for consistency
+    selected.sort(key=lambda e: e[1])  # is_right: 0 (left) before 1 (right)
+
+    result_bboxes = [s[0] for s in selected]
+    result_is_right = [s[1] for s in selected]
+    n_filtered = n_original - len(result_bboxes)
+
+    if n_filtered > 0:
+        logging.info(f"  [filter] kept {len(result_bboxes)}/{n_original} hands "
+                     f"({len([s for s in selected if s[1] == 0])}L "
+                     f"{len([s for s in selected if s[1] == 1])}R)")
+
+    return result_bboxes, result_is_right, n_filtered
+
+
+# ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
 
@@ -188,19 +283,28 @@ def load_models(device):
     return model, cfg, detector
 
 
-def process_frame(model, cfg, detector, img_bgr, device, conf=0.3):
+def process_frame(model, cfg, detector, img_bgr, device, conf=0.3,
+                  max_hands=2, top_margin_ratio=0.12):
     detections = detector(img_bgr, conf=conf, verbose=False)[0]
     bboxes, is_right_list = [], []
     for det in detections:
         bbox = det.boxes.data.cpu().detach().squeeze().numpy()
         is_right_list.append(det.boxes.cls.cpu().detach().squeeze().item())
-        bboxes.append(bbox[:4].tolist())
+        bboxes.append(bbox[:5].tolist())  # [x1,y1,x2,y2,conf]
+
+    img_h, img_w = img_bgr.shape[:2]
+
+    # Filter: keep only the main two hands, discard faces / false positives
+    bboxes, is_right_list, _ = filter_hand_detections(
+        bboxes, is_right_list, img_h, img_w,
+        max_hands=max_hands, top_margin_ratio=top_margin_ratio)
 
     if len(bboxes) == 0:
         return None
 
-    boxes = np.stack(bboxes)
-    right = np.stack(is_right_list)
+    # ViTDetDataset expects (N,4) boxes [x1,y1,x2,y2]; our bboxes carry conf at [4]
+    boxes = np.array([b[:4] for b in bboxes], dtype=np.float32)
+    right = np.array(is_right_list, dtype=np.float32)
     dataset = ViTDetDataset(cfg, img_bgr, boxes, right, rescale_factor=2.0)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False,
                                              num_workers=0)
@@ -273,7 +377,14 @@ def main():
                         choices=['left', 'right', 'both'])
     parser.add_argument('--start_frame', type=int, default=0)
     parser.add_argument('--end_frame', type=int, default=-1)
-    parser.add_argument('--conf', type=float, default=0.3)
+    parser.add_argument('--conf', type=float, default=0.3,
+                        help='YOLO detection confidence threshold')
+    parser.add_argument('--max_hands', type=int, default=2,
+                        help='Maximum number of hands to keep per frame (default: 2)')
+    parser.add_argument('--hand_top_margin', type=float, default=0.12,
+                        help='Ignore detections whose centre is above this fraction '
+                             'of image height (default: 0.12; 0=off). '
+                             'Faces/high false-positives are filtered this way.')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
@@ -324,7 +435,9 @@ def main():
             img_bgr = cv2.imread(color_files[i])
             if img_bgr is None:
                 continue
-            result = process_frame(model, cfg, detector, img_bgr, device, conf=args.conf)
+            result = process_frame(model, cfg, detector, img_bgr, device,
+                                    conf=args.conf, max_hands=args.max_hands,
+                                    top_margin_ratio=args.hand_top_margin)
 
             if result is not None and len(result['verts_mano']) > 0:
                 N = len(result['verts_mano'])
