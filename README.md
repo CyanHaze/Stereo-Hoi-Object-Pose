@@ -109,20 +109,22 @@ python scripts/run_fp_track.py --clip clip03 --camera right --debug 2
 **必须先跑完 Step 2 + Step 3**。`run_fusion.py` 不跑 FoundationPose，只读取已有 pose 文件。
 
 ```bash
-# 纯融合 (无 GPU)
-python scripts/run_fusion.py --clip clip03
+# 推荐：outlier 剔除 + Gaussian 时域平滑
+python scripts/run_fusion.py --clip clip03 --method average --smooth 7
 
-# 融合 + 可视化
+# 纯融合 (无 outlier 剔除)
+python scripts/run_fusion.py --clip clip03 --no_outlier
+
+# 更严格的 outlier 阈值
+python scripts/run_fusion.py --clip clip03 --outlier_trans 0.03 --outlier_rot 15
+
+# 融合 + 可视化 (需要 FP Docker)
 python scripts/run_fusion.py --clip clip03 --vis
 
 # 消融实验
 python scripts/run_fusion.py --clip clip03 --method left_only --vis
 python scripts/run_fusion.py --clip clip03 --method right_only --vis
-python scripts/run_fusion.py --clip clip03 --method average --vis
 python scripts/run_fusion.py --clip clip03 --method left_main --vis
-
-# 加时域平滑
-python scripts/run_fusion.py --clip clip03 --method left_main --smooth 5 --vis
 ```
 
 | `--method` | 说明 |
@@ -132,9 +134,16 @@ python scripts/run_fusion.py --clip clip03 --method left_main --smooth 5 --vis
 | `left_only` | 仅用左视角 (消融基线) |
 | `right_only` | 仅用右视角变换到左坐标系 (sanity check) |
 
-`smooth`: 可选时序平滑 (滑动窗口，奇数)
+| `--outlier_*` | 默认 | 说明 |
+|---|---|---|
+| `--outlier_trans` | 0.05 (5cm) | 左右平移差超过此值 → 剔除该帧右视角 |
+| `--outlier_rot` | 30 (deg) | 左右旋转差超过此值 → 剔除该帧右视角 |
+| `--no_outlier` | - | 关闭 outlier 剔除 |
 
-输出 → `foundationpose_v2/fused/ob_in_cam/*.txt` (+ `track_vis/` + `video_frames/` 当 `--vis`)
+| `--smooth` | 说明 |
+|---|---|
+| `--smooth 7` | 时域平滑窗口（奇数；默认 `gaussian` 核） |
+| `--smooth_method moving_avg` | 改用均匀窗口平滑 |
 
 ### Step 5: 生成对比视频
 

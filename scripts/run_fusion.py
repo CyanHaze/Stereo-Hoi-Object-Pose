@@ -27,14 +27,17 @@ Usage:
     # Fusion + visualization (needs FoundationPose Docker container)
     python scripts/run_fusion.py --clip clip03 --vis
 
-    # Fusion + left_main (average only when views agree)
-    python scripts/run_fusion.py --clip clip03 --method left_main --vis
+    # With outlier rejection + Gaussian temporal smoothing (recommended)
+    python scripts/run_fusion.py --clip clip03 --method average --smooth 7 --vis
+
+    # Tighter outlier thresholds (reject right frame if L-R diff > 3cm or > 15deg)
+    python scripts/run_fusion.py --clip clip03 --outlier_trans 0.03 --outlier_rot 15
 
     # Ablation: left-only baseline
     python scripts/run_fusion.py --clip clip03 --method left_only --vis
 
-    # With temporal smoothing
-    python scripts/run_fusion.py --clip clip03 --smooth 5 --vis
+    # Disable outlier rejection (use all right frames)
+    python scripts/run_fusion.py --clip clip03 --no_outlier --vis
 """
 
 import argparse, os, sys, json, glob, logging
@@ -44,8 +47,69 @@ repo_dir = os.path.dirname(code_dir)
 
 import numpy as np
 import cv2
-from scipy.spatial.transform import Rotation as R
 
+
+# ---------------------------------------------------------------------------
+# Pure-numpy rotation (replaces scipy.spatial.transform.Rotation)
+# ---------------------------------------------------------------------------
+
+class Rotation:
+    """Minimal pure-numpy Rotation class (drop-in for scipy.spatial.transform.Rotation)."""
+
+    def __init__(self, quat):
+        self._q = np.asarray(quat, dtype=np.float64)
+
+    @classmethod
+    def from_matrix(cls, mat):
+        """3x3 rotation matrix -> Rotation."""
+        m = np.asarray(mat, dtype=np.float64)
+        trace = np.trace(m)
+        if trace > 0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m[2, 1] - m[1, 2]) / s
+            y = (m[0, 2] - m[2, 0]) / s
+            z = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            w = (m[2, 1] - m[1, 2]) / s
+            x = 0.25 * s
+            y = (m[0, 1] + m[1, 0]) / s
+            z = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            w = (m[0, 2] - m[2, 0]) / s
+            x = (m[0, 1] + m[1, 0]) / s
+            y = 0.25 * s
+            z = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            w = (m[1, 0] - m[0, 1]) / s
+            x = (m[0, 2] + m[2, 0]) / s
+            y = (m[1, 2] + m[2, 1]) / s
+            z = 0.25 * s
+        return cls([x, y, z, w])
+
+    @classmethod
+    def from_quat(cls, q):
+        """Quaternion [x,y,z,w] -> Rotation."""
+        return cls(q)
+
+    def as_quat(self):
+        """Return [x, y, z, w]."""
+        return self._q.copy()
+
+    def as_matrix(self):
+        """Return 3x3 rotation matrix."""
+        x, y, z, w = self._q
+        return np.array([
+            [1 - 2*y*y - 2*z*z,     2*x*y - 2*z*w,     2*x*z + 2*y*w],
+            [    2*x*y + 2*z*w, 1 - 2*x*x - 2*z*z,     2*y*z - 2*x*w],
+            [    2*x*z - 2*y*w,     2*y*z + 2*x*w, 1 - 2*x*x - 2*y*y],
+        ], dtype=np.float64)
+
+
+R = Rotation  # alias, same interface as scipy
 
 # ---------------------------------------------------------------------------
 # Coordinate transform
@@ -180,15 +244,68 @@ def fuse_left_main(poses_left, poses_right, valid,
 
 
 # ---------------------------------------------------------------------------
+# Outlier detection
+# ---------------------------------------------------------------------------
+
+def detect_outliers(poses_left, poses_right, valid,
+                    trans_thresh=0.05, rot_thresh_deg=30.0):
+    """Mark frames where right tracking likely failed as invalid.
+
+    A frame is an outlier if left-right translation diff > trans_thresh (m)
+    OR left-right rotation diff > rot_thresh_deg.
+
+    Returns (valid_out, n_outliers).
+    """
+    valid_out = valid.copy()
+    n_outliers = 0
+    diffs = []
+    for i in range(len(valid)):
+        if not valid[i]:
+            continue
+        t_diff = float(np.linalg.norm(poses_left[i, :3, 3] - poses_right[i, :3, 3]))
+        r_diff = _rotation_diff_deg(poses_left[i, :3, :3], poses_right[i, :3, :3])
+        diffs.append((t_diff, r_diff))
+        if t_diff > trans_thresh or r_diff > rot_thresh_deg:
+            valid_out[i] = False
+            n_outliers += 1
+
+    diffs = np.array(diffs) if diffs else np.zeros((0, 2))
+    if len(diffs) > 0:
+        logging.info(f"  Outlier check: {n_outliers}/{len(diffs)} frames rejected "
+                     f"(trans>{trans_thresh*1000:.0f}mm | rot>{rot_thresh_deg:.0f}deg)")
+        logging.info(f"  L-R stats (valid frames): "
+                     f"trans median={np.median(diffs[:,0])*1000:.1f}mm "
+                     f"max={diffs[:,0].max()*1000:.1f}mm | "
+                     f"rot median={np.median(diffs[:,1]):.1f}deg "
+                     f"max={diffs[:,1].max():.1f}deg")
+    return valid_out
+
+
+# ---------------------------------------------------------------------------
 # Temporal smoothing
 # ---------------------------------------------------------------------------
 
-def smooth_poses(poses, window=5):
-    """Moving-average smooth a pose sequence in quaternion + translation space."""
+def _gaussian_kernel(size, sigma=None):
+    """1D Gaussian kernel."""
+    if sigma is None:
+        sigma = size / 4.0
+    x = np.arange(size) - (size - 1) / 2.0
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    return k / k.sum()
+
+
+def smooth_poses(poses, window=5, method='gaussian'):
+    """Smooth a pose sequence in quaternion + translation space.
+
+    Args:
+        window: kernel size (odd)
+        method: 'moving_avg' (uniform) or 'gaussian' (Gaussian-weighted, default)
+    """
     if window <= 1:
         return poses.copy()
 
-    from scipy.ndimage import uniform_filter1d
+    if window % 2 == 0:
+        window += 1
 
     N = poses.shape[0]
     quats = np.zeros((N, 4))
@@ -201,12 +318,24 @@ def smooth_poses(poses, window=5):
         if np.dot(quats[i], quats[i - 1]) < 0:
             quats[i] = -quats[i]
 
+    if method == 'gaussian':
+        kernel = _gaussian_kernel(window)
+    else:
+        kernel = np.ones(window) / window
+
+    half = window // 2
     smoothed_quat = np.zeros_like(quats)
     smoothed_trans = np.zeros_like(trans)
-    for d in range(4):
-        smoothed_quat[:, d] = uniform_filter1d(quats[:, d], size=window)
-    for d in range(3):
-        smoothed_trans[:, d] = uniform_filter1d(trans[:, d], size=window)
+
+    for i in range(N):
+        lo = max(0, i - half)
+        hi = min(N, i + half + 1)
+        k_lo = half - (i - lo)
+        k_hi = half + (hi - i)
+        k = kernel[k_lo:k_hi]
+        k = k / k.sum()
+        smoothed_quat[i] = (quats[lo:hi].T @ k).T
+        smoothed_trans[i] = (trans[lo:hi].T @ k).T
 
     norms = np.linalg.norm(smoothed_quat, axis=1, keepdims=True)
     smoothed_quat /= norms
@@ -416,8 +545,17 @@ def main():
     parser.add_argument('--method', type=str, default='average',
                         choices=['average', 'left_main', 'left_only', 'right_only'],
                         help='Fusion strategy (default: average)')
+    parser.add_argument('--outlier_trans', type=float, default=0.05,
+                        help='Reject right frame if L-R translation diff > this (m; default: 0.05=5cm)')
+    parser.add_argument('--outlier_rot', type=float, default=30.0,
+                        help='Reject right frame if L-R rotation diff > this (deg; default: 30)')
+    parser.add_argument('--no_outlier', action='store_true',
+                        help='Disable outlier rejection')
     parser.add_argument('--smooth', type=int, default=0,
                         help='Temporal smoothing window (odd; 0=off; e.g. 5)')
+    parser.add_argument('--smooth_method', type=str, default='gaussian',
+                        choices=['gaussian', 'moving_avg'],
+                        help='Smoothing kernel (default: gaussian)')
     parser.add_argument('--vis', action='store_true',
                         help='Generate track_vis + video_frames (requires FoundationPose/CUDA)')
     parser.add_argument('--shorter_side', type=int, default=800,
@@ -464,6 +602,13 @@ def main():
 
     valid = ~miss_left & ~miss_right
 
+    # ----- outlier rejection -----
+    if not args.no_outlier:
+        logging.info(f"Outlier rejection: trans>{args.outlier_trans*1000:.0f}mm | rot>{args.outlier_rot:.0f}deg")
+        valid = detect_outliers(poses_left, poses_right, valid,
+                                trans_thresh=args.outlier_trans,
+                                rot_thresh_deg=args.outlier_rot)
+
     # ----- fuse -----
     if args.method == 'average':
         fused = fuse_average(poses_left, poses_right, valid)
@@ -480,9 +625,8 @@ def main():
 
     # ----- temporal smoothing -----
     if args.smooth > 0:
-        w = args.smooth if args.smooth % 2 == 1 else args.smooth + 1
-        logging.info(f"Temporal smoothing: window={w}")
-        fused = smooth_poses(fused, window=w)
+        logging.info(f"Temporal smoothing: window={args.smooth}, method={args.smooth_method}")
+        fused = smooth_poses(fused, window=args.smooth, method=args.smooth_method)
 
     # ----- save poses -----
     save_poses(out_dir, id_strs, fused)
