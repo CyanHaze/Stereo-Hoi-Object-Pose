@@ -1,193 +1,168 @@
-# SRTP 复现 — 双目 RGB-D 物体位姿追踪
+# Stereo FoundationPose — 双目 HOI 物体位姿估计
 
-基于 FoundationStereo + FoundationPose 的双目 6DoF 物体位姿追踪优化管线。
+基于双目视频 + 已重建 mesh，估计准确、连续、稳定的物体 6D pose 序列。
 
-## 目录结构
-
-```
-Reproduction/
-├── reference.pdf                  # 参考论文
-├── Fast-FoundationStereo/         # 立体匹配 → 深度图
-├── FoundationPose/                # 6DoF 物体位姿估计与追踪
-├── data/
-│   ├── clip03/                    # 1231 帧 ZED-M 双目序列
-│   └── clip04/                    # 1323 帧 ZED-M 双目序列
-├── scripts/
-│   ├── run_ffs_batch.py           # Step 2: FFS 批量深度生成
-│   ├── run_fp_track.py            # Step 2.5: FoundationPose 追踪 (left/right)
-│   ├── run_demo_save_depth.py     # FFS 单帧推理（被 run_ffs_batch 调用）
-│   └── convert_depth_npy_to_png.py # 深度格式转换 (npy → uint16 PNG)
-└── README.md
-```
-
-## 数据格式 (clip03/clip04)
-
-```
-clipXX/
-├── calib.json                     # 双目内参 + baseline (≈6.3cm)
-├── rgb/*.jpg                      # 左 RGB (1920×1080, rectified)
-├── right/*.jpg                    # 右 RGB (1920×1080, rectified)
-├── ffs/
-│   ├── cam_K.txt                  # 左相机 3×3 内参
-│   └── depth/*.png                # FFS 深度图 (uint16 mm) — 核心中间产物
-├── mask/
-│   ├── object/*.png               # 物体 mask (uint8, 0/255)
-│   └── hand/*.png                 # 手部 mask
-├── mesh/
-│   ├── clean_mesh.obj             # 目标物体 3D 网格
-│   ├── clean_mesh.mtl
-│   └── clean_texture.png
-├── foundationpose/run/            # 师兄的单目 FP 基线结果
-│   ├── ob_in_cam/NNNNN.txt        # 每帧 4×4 位姿矩阵
-│   ├── track_vis/NNNNN.png        # 追踪可视化叠加图
-│   └── scales/unified_scale.txt   # mesh 缩放因子
-└── foundationpose_v2/
-    ├── run/ob_in_cam/NNNNN.txt    # 你的 FP 左目输出
-    └── run_right/ob_in_cam/...    # 你的 FP 右目输出
-```
+**核心思路**：将 AGILE 的 setting 从单目扩展到双目 — 用 Fast-FoundationStereo 获取更可靠的双目深度，用 FoundationPose 在左右视角上独立 tracking，再融合两个视角的结果。
 
 ## 环境
 
-### FoundationPose (Docker)
+| 环境 | 用途 |
+|------|------|
+| `conda activate ffs` | Fast-FoundationStereo 深度推理 |
+| FoundationPose Docker 容器 | FoundationPose tracking + 融合可视化 (`--vis`) |
 
-```bash
-cd FoundationPose/docker
-bash run_container.sh              # 启动容器（已挂载 /mnt:/mnt）
-docker exec -it foundationpose bash  # 进入容器
-```
+> 纯融合（不加 `--vis`）不需要 Docker，任意有 numpy+scipy 的 Python 环境均可。
 
-### Fast-FoundationStereo (conda)
+## 数据准备
 
-```bash
-conda activate ffs
-cd Fast-FoundationStereo
-```
-
-## Pipeline 总览
+每个 clip 目录需包含：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Step 2: FFS 深度生成                                           │
-│  run_ffs_batch.py                                               │
-│  ┌──────────┐  ┌───────────┐  ┌───────────┐                    │
-│  │ rgb/*.jpg │  │ right/*.jpg│  │ cam_K.txt │  calib.json      │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘                  │
-│        └──────────────┬──────────────┘                          │
-│                       ▼                                         │
-│              Fast-FoundationStereo                              │
-│                       │                                         │
-│                       ▼                                         │
-│               ffs/depth/*.png  (uint16 mm, left-camera)         │
-└───────────────────────┬─────────────────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Step 2.5: FoundationPose 追踪                                  │
-│  run_fp_track.py --camera left|right                            │
-│                                                                 │
-│  Left camera:                                                   │
-│    rgb/*.jpg + ffs/depth/*.png + mask/object/*.png → pose_left │
-│                                                                 │
-│  Right camera:                                                  │
-│    right/*.jpg + ffs/depth/*.png (warped via baseline)          │
-│                + mask/object/*.png (warped) → pose_right        │
-│                                                                 │
-│  输出: foundationpose_v2/run[_right]/ob_in_cam/NNNNN.txt        │
-└─────────────────────────────────────────────────────────────────┘
+data/<clip>/
+├── rgb/                    # 左视角帧  00000.jpg ...
+├── right/                  # 右视角帧  00000.jpg ...
+├── calib.json              # 双目标定 (K_left, K_right, baseline_m)
+├── mask/object/            # 物体 mask  00000.png ...
+├── mesh/clean_mesh.obj     # 带纹理物体 mesh
+└── ffs/cam_K.txt           # 左相机内参 (3行 3x3)
 ```
 
-## 运行步骤
+帧编号 5 位 0-padding（`00000.jpg` ...），所有模态共享同一编号。
 
-### Step 2: FFS 批量深度生成
+### 坐标系与单位
 
-从左右目 RGB 生成深度图，保存为 `ffs/depth/*.png`（uint16 mm）。
+- 深度图：**uint16 PNG，单位毫米**（÷1000 = 米）
+- 位姿 `ob_in_cam`：**4×4 齐次矩阵**，平移单位**米**
+- 相机坐标系：OpenCV/ZED 约定（+X 右、+Y 下、+Z 前）
+- 双目已 rectified，`K_left == K_right`，畸变全 0
+- `calib.json::baseline_m` ≈ 6.3 cm，右相机在左相机 +X 方向
+
+### calib.json
+
+```json
+{
+  "K_left":  [[fx,0,cx],[0,fy,cy],[0,0,1]],
+  "K_right": [...],
+  "D_left":  [0,...,0],
+  "D_right": [...],
+  "baseline_m": 0.0630453,
+  "width": 1920, "height": 1080, "fps": 30
+}
+```
+
+## Pipeline
+
+```
+双目视频
+  → [1] run_ffs_batch.py  → ffs/depth/ (左视图深度, uint16 mm)
+  → [2] run_fp_track.py --camera left   → foundationpose_v2/run/ob_in_cam/*.txt
+  → [3] run_fp_track.py --camera right  → foundationpose_v2/run_right/ob_in_cam/*.txt
+  → [4] run_fusion.py   → foundationpose_v2/fused/ob_in_cam/*.txt
+```
+
+### Step 1: 双目深度
 
 ```bash
 conda activate ffs
 cd F:/Research/02_Projects/SRTP/Reproduction
 
-# 前 10 帧测试
+# 测试前 10 帧
 python scripts/run_ffs_batch.py --clip clip03 --end_frame 10
 
-# 全量（自动跳过已存在的 depth PNG）
+# 全序列 (自动跳过已有结果)
 python scripts/run_ffs_batch.py --clip clip03
 
-# 强制覆盖已有 depth
+# 强制覆盖
 python scripts/run_ffs_batch.py --clip clip03 --overwrite
-
-# 仅预览（不实际运行）
-python scripts/run_ffs_batch.py --clip clip03 --dry_run
 ```
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--clip` | `clip03` | 数据子目录 |
-| `--start_frame` | `0` | 起始帧 |
-| `--end_frame` | `-1` | 结束帧（-1=全部） |
-| `--overwrite` | `false` | 覆盖已有 depth PNG |
-| `--dry_run` | `false` | 仅列出待处理帧 |
-| `--scale` | `1.0` | 图像缩放比例 |
-| `--save_intermediate` | `false` | 保存 disp.npy / cloud.ply |
+输出 → `data/<clip>/ffs/depth/*.png` (uint16 mm)
 
-输出：
-- `data/{clip}/ffs/depth/*.png` — uint16 mm 深度图（**核心产物**，直接喂给 FP）
-
-### Step 2.5: FoundationPose 位姿追踪
-
-以 `ffs/depth/*.png` 为深度输入，运行 FoundationPose 做 6DoF 追踪。
+### Step 2: FoundationPose 左视角 tracking
 
 ```bash
-# 进入 FoundationPose Docker 容器
-docker exec -it foundationpose bash
+# FoundationPose Docker 容器内
 cd /mnt/f/Research/02_Projects/SRTP/Reproduction
 
-# === 左目追踪 ===
+# 测试前 5 帧
 python scripts/run_fp_track.py --clip clip03 --camera left --debug 1 --end_frame 5
-python scripts/run_fp_track.py --clip clip03 --camera left --debug 2   # 全量
 
-# === 右目追踪（深度由左目 + baseline 自动 warp，无需额外数据）===
-python scripts/run_fp_track.py --clip clip03 --camera right --debug 1 --end_frame 5
+# 全序列 + 保存可视化
+python scripts/run_fp_track.py --clip clip03 --camera left --debug 2
+```
+
+输出 → `foundationpose_v2/run/ob_in_cam/*.txt` + `track_vis/` + `video_frames/`
+
+### Step 3: FoundationPose 右视角 tracking
+
+```bash
 python scripts/run_fp_track.py --clip clip03 --camera right --debug 2
 ```
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--clip` | `clip03` | 数据子目录 |
-| `--camera` | `left` | `left`（左目）/ `right`（右目，深度由 baseline warp） |
-| `--shorter_side` | `800` | 下采样分辨率（8GB 显存: 800；>12GB: 1080） |
-| `--debug` | `1` | 0=无输出；1=弹窗预览；2=保存 track_vis |
-| `--start_frame` | `0` | 起始帧 |
-| `--end_frame` | `-1` | 结束帧（-1=全部） |
-| `--debug_dir` | auto | 输出目录（默认 `foundationpose_v2/run[_right]/`） |
-| `--est_refine_iter` | `5` | 初始帧估计迭代次数 |
-| `--track_refine_iter` | `2` | 追踪帧迭代次数 |
-| `--zfar` | `2.0` | 深度远裁剪面（米） |
-| `--mesh_scale` | auto | mesh 缩放因子（自动从 baseline 读取） |
+右视角深度由左视角 FFS 深度通过 stereo baseline **自动 warp**，不需要单独跑 FFS。
 
-输出：
-- `foundationpose_v2/run/ob_in_cam/NNNNN.txt` — 左目 4×4 位姿
-- `foundationpose_v2/run_right/ob_in_cam/NNNNN.txt` — 右目 4×4 位姿
-- `foundationpose_v2/run[_right]/track_vis/NNNNN.png` — 可视化 (`--debug 2`)
+输出 → `foundationpose_v2/run_right/ob_in_cam/*.txt` + `track_vis/` + `video_frames/`
 
-### Step 3: 双目几何约束位姿精修（TODO）
+### Step 4: 多视角融合
 
-以左右目独立位姿为初值，引入双目标定参数进行多视角联合优化。
+**必须先跑完 Step 2 + Step 3**。`run_fusion.py` 不跑 FoundationPose，只读取已有 pose 文件。
 
-### Step 4: 单目 vs 双目 对比评价（TODO）
+```bash
+# 纯融合 (无 GPU)
+python scripts/run_fusion.py --clip clip03
 
-右目重投影误差、时序抖动、定性对比。
+# 融合 + 可视化
+python scripts/run_fusion.py --clip clip03 --vis
 
-## 关键数据流说明
+# 消融实验
+python scripts/run_fusion.py --clip clip03 --method left_only --vis
+python scripts/run_fusion.py --clip clip03 --method right_only --vis
+python scripts/run_fusion.py --clip clip03 --method average --vis
+python scripts/run_fusion.py --clip clip03 --method left_main --vis
 
-- **唯一中间产物**：`ffs/depth/*.png`（uint16 mm 左相机深度）
-- **FFS batch** 产出 → `ffs/depth/*.png`
-- **FP left** 直接消费 → `ffs/depth/*.png`
-- **FP right** 通过 stereo baseline 将左深度 warp 到右视图（不需要 disparity / raw_rerun）
-- **深度 warp 原理**：rectified stereo 中，左像素 `(u,v)` 深度 Z → 右像素 `(u - fx·baseline/Z, v)`
+# 加时域平滑
+python scripts/run_fusion.py --clip clip03 --method left_main --smooth 5 --vis
+```
 
-## 已知修改
+| `--method` | 说明 |
+|---|---|
+| `average` | 等权平均 (quaternion mean + translation mean) |
+| `left_main` | 默认用 left，仅当左右一致时平均 (平移差<2cm & 旋转差<10°) |
+| `left_only` | 仅用左视角 (消融基线) |
+| `right_only` | 仅用右视角变换到左坐标系 (sanity check) |
 
-对 `FoundationPose/Utils.py` 做了两处适配（mesh 缺少 UV 坐标时降级到 vertex color）：
+`smooth`: 可选时序平滑 (滑动窗口，奇数)
 
-- L106: 增加 `and mesh.visual.uv is not None` 条件
-- L119-123: `vertex_colors` 访问改用 `getattr` 安全读取
+输出 → `foundationpose_v2/fused/ob_in_cam/*.txt` (+ `track_vis/` + `video_frames/` 当 `--vis`)
+
+## 输出结构
+
+```
+data/<clip>/foundationpose_v2/
+├── run/                     # 左视角 tracking
+│   ├── ob_in_cam/*.txt      # 4x4 位姿矩阵 (左相机坐标系, 米)
+│   ├── track_vis/*.png      # mesh 渲染视图
+│   └── video_frames/*.png   # RGB 叠加视图
+├── run_right/               # 右视角 tracking (结构同上)
+└── fused/                   # 融合结果
+    ├── ob_in_cam/*.txt      # 4x4 位姿矩阵 (左相机坐标系)
+    ├── track_vis/*.png      # (需 --vis)
+    └── video_frames/*.png   # (需 --vis)
+```
+
+## 脚本
+
+| 脚本 | 功能 | 环境 |
+|------|------|------|
+| `scripts/run_ffs_batch.py` | 批量双目深度估计 | conda ffs |
+| `scripts/run_fp_track.py` | FoundationPose 单视角 tracking | FP Docker |
+| `scripts/run_fusion.py` | 左右 pose 多视角融合 | 任意 Python① |
+| `scripts/run_demo_save_depth.py` | FFS 单帧推理 (被 run_ffs_batch 调用) | conda ffs |
+| `scripts/convert_depth_npy_to_png.py` | depth npy → uint16 PNG 转换 | 任意 Python |
+
+> ① `--vis` 需要 FP Docker
+
+## 参考
+
+- [Fast-FoundationStereo](https://github.com/NVlabs/FoundationStereo)
+- [FoundationPose](https://github.com/NVlabs/FoundationPose)
