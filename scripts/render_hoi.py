@@ -158,16 +158,6 @@ def main():
 
     # --- Camera ---
     K = np.loadtxt(os.path.join(data_dir, 'ffs', 'cam_K.txt')).reshape(3, 3)
-    # Virtual K for hand rendering (WiLoR camera model)
-    sample_imgs = sorted(glob.glob(os.path.join(rgb_dir, '*.jpg')))
-    if not sample_imgs:
-        sample_imgs = sorted(glob.glob(os.path.join(rgb_dir, '*.png')))
-    img = cv2.imread(sample_imgs[0])
-    img_h, img_w = img.shape[:2]
-    f_virt = 5000.0 / 256.0 * max(img_w, img_h)
-    K_virt = np.array([[f_virt, 0, img_w / 2.],
-                       [0, f_virt, img_h / 2.],
-                       [0, 0, 1]], dtype=np.float32)
 
     # --- Object mesh ---
     mesh_file = os.path.join(data_dir, 'mesh', 'clean_mesh.obj')
@@ -248,7 +238,7 @@ def main():
             draw_posed_3d_box(K, img_bgr, center_pose, bbox,
                                line_color=(0, 220, 80), linewidth=2)
 
-        # --- Render hands ---
+        # --- Render hands (metric camera frame, same K as object) ---
         hand_path = os.path.join(hand_dir, f'{sid}.npz')
         if os.path.exists(hand_path):
             hd = np.load(hand_path)
@@ -258,9 +248,12 @@ def main():
                 color = (255, 128, 0) if is_r else (0, 220, 220)  # orange / yellow-cyan
                 w = hd['wrist_3d'][n]
                 ok = hd['depth_ok'][n]
-                # Use virtual-camera rendering for correct 2D projection
-                img_bgr = render_mesh(img_bgr, hd['verts_virt'][n],
-                                       mano_faces, K_virt, color=color, alpha=0.45)
+                # Anchor MANO hand (real meters) at metric wrist position,
+                # then render through the real K — same camera as the object.
+                wrist_mano = hd['joints'][n, 0].astype(np.float32)  # (3,)
+                verts_hand_cam = hd['verts_mano'][n] - wrist_mano + w
+                img_bgr = render_mesh(img_bgr, verts_hand_cam,
+                                       mano_faces, K, color=color, alpha=0.45)
                 # Draw wrist dot
                 if ok and np.linalg.norm(w) > 0.001:
                     pw = K @ w

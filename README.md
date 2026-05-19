@@ -57,17 +57,22 @@ data/<clip>/
 
 ```
 双目视频
-  ├── 物体位姿 ─────────────────────────────────────
-  │ → [1] run_ffs_batch.py  → ffs/depth/ (左视图深度, uint16 mm)
-  │ → [2] run_fp_track.py --camera left   → foundationpose_v2/run/ob_in_cam/*.txt
-  │ → [3] run_fp_track.py --camera right  → foundationpose_v2/run_right/ob_in_cam/*.txt
-  │ → [4] run_fusion.py   → foundationpose_v2/fused/ob_in_cam/*.txt
+  ├── 物体位姿 ─────────────────────────────────────────
+  │   [1] run_ffs_batch.py        → ffs/depth/ (左视图深度)
+  │   [2] run_fp_track.py  left   → foundationpose_v2/run/
+  │   [3] run_fp_track.py  right  → foundationpose_v2/run_right/
+  │   [4] run_fusion.py           → foundationpose_v2/fused/
   │
-  ├── 手部 mesh ────────────────────────────────────
-  │ → [5] run_wilor_hand.py --camera left   → wilor/left/*.npz
+  ├── 手部 mesh ────────────────────────────────────────
+  │   [5] run_wilor_hand.py  left → wilor/left/*.npz
   │
-  └── 手物可视化 ───────────────────────────────────
-      → [6] render_hoi.py  → hoi/video_frames/*.png
+  ├── 可视化 & 浏览 ────────────────────────────────────
+  │   [6] build_comparison_video.py  → track.mp4 + 对比视频
+  │   [7] render_hoi.py              → hoi/video_frames/*.png
+  │   [8] hoi_viewer.py              → Viser 交互式 3D (localhost)
+  │
+  └── 网页 Demo ───────────────────────────────────────
+      [9] export_web_demo.py --rgb   → web_demo/ 静态 Three.js
 ```
 
 ### Step 1: 双目深度
@@ -234,9 +239,9 @@ python scripts/render_hoi.py --clip clip03 --fps 30
 
 渲染内容：右手（橙）、左手（青）、物体 mesh（绿半透明）、物体 3D bbox（绿线框）、手腕标记点（红点）。
 
-### Step 8: 交互式 3D 浏览
+### Step 8: 交互式 3D 浏览 (Viser)
 
-**前置**：需先跑完 Step 2/4（物体 pose）和 Step 6/7（手部数据）。需要 `viser` 包（`pip install viser`）。
+**前置**：需先跑完 Step 4（融合 pose）和 Step 5（手部数据）。需要 `viser` 包（`pip install viser`）。数据加载和坐标转换逻辑由 `scripts/hoi_data.py` 提供。
 
 ```bash
 conda activate diffusion
@@ -254,6 +259,34 @@ python scripts/hoi_viewer.py --clip clip03 --port 8081 --fps 15
 **场景内容**：物体 mesh（绿半透明）、物体 3D bbox（绿线框）、左手 mesh（橙）、右手 mesh（青）、手腕标记点（红）、相机原点坐标轴、参考网格。
 
 **操作**：鼠标左键旋转、右键平移、滚轮缩放；下方面板控制播放/暂停、帧滑块、各元素显隐与透明度。
+
+数据加载和坐标转换逻辑提取在 `scripts/hoi_data.py`，被 `hoi_viewer.py`、`export_web_demo.py` 等共用。
+
+### Step 9: 网页 Demo
+
+**前置**：需先跑完 Step 4（融合 pose）和 Step 5（手部数据）。
+
+```bash
+conda activate diffusion
+cd F:/Research/02_Projects/SRTP/Reproduction
+
+# 导出 clip03（每3帧采样，含 RGB 缩略图）
+python scripts/export_web_demo.py --clip clip03 --step 3 --rgb
+
+# 启动本地 HTTP 服务
+cd web_demo && python -m http.server 8080
+```
+
+浏览器打开 `http://localhost:8080`，页面包括：
+
+- **Hero**：标题 + feature cards
+- **3D 画布**：物体 mesh + bbox + 左手 mesh + 手腕圆点，OrbitControls 自由视角
+- **RGB Overlay**：Opacity 滑块控制原始 RGB 底图透明度，可对比 3D 重建与视频
+- **控制栏**：播放/暂停、逐帧、FPS 调节、Object/BBox/Hands/Wrist 显隐开关
+- **180 帧缩略图条**：底部可翻页缩略图条（每页 15 帧），单击跳帧，红色边框标注当前帧
+- **键盘**：Space 播放/暂停，← → 逐帧
+
+> 更改 `--step` 可调整导出帧数（`--step 6` ≈ 180 帧）。
 
 ## 输出结构
 
@@ -280,6 +313,20 @@ data/<clip>/wilor/
 
 data/<clip>/hoi/
 └── video_frames/                    # 手+物合并渲染帧 (*.png)
+
+web_demo/
+├── index.html                       # 学术风格页面 (Three.js)
+└── static/
+    ├── js/viewer.js                 # 核心 JS：加载资产 + 逐帧渲染
+    └── results/<clip>/
+        ├── metadata.json            # 帧列表、路径
+        ├── object_mesh.glb          # 物体 mesh (静态)
+        ├── object_frames.json       # 每帧 4×4 矩阵 + bbox 线段
+        ├── hand_frames.json         # 每帧手部顶点 (Three.js 坐标)
+        ├── mano_faces.json          # MANO 面索引
+        ├── rgb_index.json           # RGB/缩略图索引
+        ├── rgb/                     # 全尺寸 RGB 帧 (1920×1080)
+        └── thumbnails/              # 200px 缩略图 (180 帧条)
 ```
 
 ## 脚本
@@ -295,6 +342,8 @@ data/<clip>/hoi/
 | `scripts/run_wilor_hand.py` | WiLoR 批量手部 mesh 推理 + metric 对齐 | conda diffusion |
 | `scripts/render_hoi.py` | 手+物合并渲染（mesh + bbox 叠加） | conda diffusion |
 | `scripts/hoi_viewer.py` | Viser 交互式 3D 浏览器（自由视角） | conda diffusion |
+| `scripts/hoi_data.py` | 共享模块：数据加载、坐标转换、MANO faces | conda diffusion |
+| `scripts/export_web_demo.py` | 导出静态网页资产（GLB + JSON + 缩略图） | conda diffusion |
 
 > ① `--vis` 需要 FP Docker
 > ② `render` 模式需 `trimesh`(可选，AABB fallback)；`compose` 模式需 `ffmpeg`
@@ -316,6 +365,32 @@ pip install --no-build-isolation "chumpy @ git+https://github.com/mattloper/chum
 1. 注册 [mano.is.tue.mpg.de](https://mano.is.tue.mpg.de)
 2. 下载 `mano_v*_*.zip`，解压得到 `MANO_RIGHT.pkl`
 3. 放到 `WiLoR/mano_data/MANO_RIGHT.pkl`
+
+## 技术说明
+
+### 右视角深度 (Step 3)
+
+右视角深度由左视角 FFS 深度通过 stereo baseline **forward warp** 得到，不单独跑 FFS：
+
+```
+u_right = u_left - fx * baseline / Z
+```
+
+多左像素映射到同一右像素时取**最小深度**（最近表面优先）。空洞由 nearest-neighbor inpainting 填充。左边缘 ~140 px 的条带在左相机中不可见，该区域深度值为估计值，可能导致该区域的 tracking 质量下降。
+
+### WiLoR 坐标系对齐 (Step 5)
+
+WiLoR 在虚拟相机坐标系（fv ≈ 37500）中输出 MANO hand mesh。对齐到真实 metric 相机坐标系时采用**手腕锚定**而非各向异性缩放：
+
+```
+verts_metric = verts_mano - joints[0] + wrist_3d
+```
+
+MANO 顶点保持真实米尺度。FFS 深度用于确定手腕的 metric 3D 位置，MANO 手 mesh 整体锚定到该点。
+
+### 渲染坐标系一致性 (Step 7-8)
+
+所有 3D 渲染（2D overlay 和 3D viewer）中，手部和物体均在**左相机坐标系**（OpenCV 约定：+X 右、+Y 下、+Z 前）。`render_hoi.py` 中手部通过真实 K 投影（与物体同一相机模型）；`hoi_viewer.py` 和 web demo 中将坐标转换为 Viser/Three.js 约定（+X 右、+Y 上、+Z 后，即 `to_viser(X,Y,Z) = (X, -Y, -Z)`）。
 
 ## 参考
 

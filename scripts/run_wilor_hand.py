@@ -65,34 +65,38 @@ def cam_crop_to_full(cam_bbox, box_center, box_size, img_size, focal_length=5000
 # Metric alignment: WiLoR virtual → real camera
 # ---------------------------------------------------------------------------
 
-def align_virtual_to_metric(cam_full, verts_mano, depth_map, K, img_w, img_h, f_virt):
-    """Convert WiLoR virtual-camera coordinates to metric camera frame.
+def align_virtual_to_metric(cam_full, verts_mano, joints, depth_map, K, img_w, img_h, f_virt):
+    """Place MANO hand at the correct metric 3D position using FFS stereo depth.
 
-    WiLoR uses a virtual camera with focal length f_virt (≈37500 for 1920-wide).
-    The MANO vertices are in meters, positioned at cam_full [tx,ty,tz] in the
-    virtual camera frame.  We convert to real camera frame (K with fx≈1505).
-
-    Two outputs:
-      verts_virt  — for RENDERING: use virtual camera (K_virt with f_virt).
-                    Guarantees correct 2D overlay (same projection as WiLoR).
-      wrist_3d    — metric wrist position from FFS depth (for downstream use).
-      verts_metric — metric 3D vertices in real camera frame.
+    MANO vertices are already in real meters — no scaling is needed.  We use
+    WiLoR's virtual camera to locate the wrist in pixel space, then back-project
+    that pixel at the FFS depth through the real camera intrinsics to obtain
+    the metric wrist position.  The full 3D hand is anchored at that point,
+    preserving its real-meter shape in all three dimensions.
 
     Returns: (verts_metric, wrist_3d, verts_virt, ok)
+        verts_metric — hand vertices in real camera frame (meters)
+        wrist_3d     — metric wrist position from FFS depth (meters)
+        verts_virt   — vertices in WiLoR virtual camera frame (for rendering)
+        ok           — whether depth alignment succeeded
     """
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
-    # --- Vertices in WiLoR virtual camera frame (for rendering) ---
-    verts_virt = verts_mano + cam_full.astype(np.float32)
+    cam_full = cam_full.astype(np.float32)
+    wrist_mano = joints[0].astype(np.float32)  # (3,) MANO wrist, real meters
 
-    # --- Wrist 2D from WiLoR projection ---
+    # Vertices in WiLoR virtual camera frame (for 2D overlay rendering)
+    verts_virt = verts_mano + cam_full
+
+    # Wrist in virtual camera frame + its 2D projection
+    wrist_virt = wrist_mano + cam_full
     wrist_px = np.array([
-        f_virt * cam_full[0] / (cam_full[2] + 1e-9) + img_w / 2.,
-        f_virt * cam_full[1] / (cam_full[2] + 1e-9) + img_h / 2.
+        f_virt * wrist_virt[0] / (wrist_virt[2] + 1e-9) + img_w / 2.,
+        f_virt * wrist_virt[1] / (wrist_virt[2] + 1e-9) + img_h / 2.
     ])
 
-    # --- Metric depth from FFS at hand region ---
+    # Metric depth from FFS at hand region (use virtual projection for pixel mask)
     px_all = (f_virt * verts_virt[:, :2] / (verts_virt[:, 2:3] + 1e-9)
               + np.array([img_w / 2., img_h / 2.])).astype(int)
     u_min = max(0, px_all[:, 0].min() - 3)
@@ -109,34 +113,20 @@ def align_virtual_to_metric(cam_full, verts_mano, depth_map, K, img_w, img_h, f_
         valid_d = np.array([])
 
     if len(valid_d) < 5:
-        verts_metric = verts_virt.copy()
-        return verts_metric, np.zeros(3, dtype=np.float32), verts_virt.copy(), False
+        return verts_virt.copy(), np.zeros(3, dtype=np.float32), verts_virt.copy(), False
 
     Z_hand = float(np.median(valid_d))
 
-    # --- Metric wrist 3D ---
+    # Metric wrist 3D: back-project WiLoR wrist pixel at FFS depth through real K
     wrist_3d = np.array([
         (wrist_px[0] - cx) * Z_hand / fx,
         (wrist_px[1] - cy) * Z_hand / fy,
         Z_hand
     ], dtype=np.float32)
 
-    # --- Metric vertices: scale virtual → real camera frame ---
-    # In virtual cam:  pixel = f_virt * X_v / Z_v + img_center
-    # In real cam:     pixel = fx * X_r / Z_r + cx
-    # For the same pixel: X_r = X_v * (Z_r / Z_v) * (f_virt / fx)
-    tz_virt = float(cam_full[2])
-    s_z = Z_hand / tz_virt
-    s_xy = (f_virt / fx) * s_z
-
-    verts_metric = verts_virt.copy()
-    verts_metric[:, 0] = verts_virt[:, 0] * s_xy
-    verts_metric[:, 1] = verts_virt[:, 1] * s_xy
-    verts_metric[:, 2] = verts_virt[:, 2] * s_z
-    # Shift origin so wrist lands at wrist_3d
-    wrist_in_scaled = np.array([cam_full[0] * s_xy, cam_full[1] * s_xy,
-                                 cam_full[2] * s_z], dtype=np.float32)
-    verts_metric = verts_metric - wrist_in_scaled + wrist_3d
+    # Anchor MANO hand at the metric wrist position.
+    # MANO vertices are in real meters — no scaling, just translation.
+    verts_metric = verts_mano - wrist_mano + wrist_3d
 
     return verts_metric, wrist_3d, verts_virt.copy(), True
 
@@ -455,10 +445,11 @@ def main():
                     if depth_m is not None:
                         vc, wr, vv, ok = align_virtual_to_metric(
                             result['cam_full'][h], result['verts_mano'][h],
+                            result['joints'][h],
                             depth_m, K, img_w, img_h, f_virt)
                     else:
-                        vc = result['verts_mano'][h] + result['cam_full'][h]
-                        vv = vc.copy()
+                        vc = result['verts_mano'][h].copy()
+                        vv = vc + result['cam_full'][h]
                         wr = np.zeros(3, dtype=np.float32)
                         ok = False
                     verts_cam_list.append(vc.astype(np.float32))

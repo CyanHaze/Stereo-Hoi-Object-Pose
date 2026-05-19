@@ -47,52 +47,44 @@ import cv2
 def warp_left_depth_to_right(depth_left_m, K, baseline_m):
     """Forward-warp left-camera depth to right-camera view.
 
-    Uses stereo geometry only: for a left pixel (u,v) at depth Z,
-    the corresponding right-image coordinate is (u - fx*baseline/Z, v).
+    For rectified stereo, the right camera is at [baseline, 0, 0] in the
+    left-camera frame.  A point at (X, Y, Z) in the left frame projects to
+    u_right = u_left - fx * baseline / Z,  v_right = v_left.
 
-    Args:
-        depth_left_m: (H, W) float32, depth in meters (left camera)
-        K: (3, 3) camera intrinsics
-        baseline_m: stereo baseline in meters
-
-    Returns:
-        depth_right_m: (H, W) float32, depth in meters (right camera)
+    When multiple left pixels map to the same right pixel (occlusion boundary),
+    we keep the *minimum* depth (closest surface).  Holes are filled with
+    nearest-neighbour inpainting — use with caution near the left image border
+    where the right camera sees extra content not visible to the left camera.
     """
     H, W = depth_left_m.shape
     fx = K[0, 0]
 
-    depth_right = np.zeros((H, W), dtype=np.float32)
-    weight = np.zeros((H, W), dtype=np.float32)
-
+    depth_right = np.full((H, W), np.inf, dtype=np.float32)
     yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
     valid = (depth_left_m > 0.001) & np.isfinite(depth_left_m)
 
     if valid.sum() == 0:
-        return depth_right
+        return np.zeros((H, W), dtype=np.float32)
 
-    # Displacement from left to right pixel (positive = rightward in left image,
-    # meaning the same point appears further LEFT in the right image)
     flow_x = fx * baseline_m / depth_left_m[valid]  # > 0
     xx_r = np.round(xx[valid] - flow_x).astype(np.int32)
     yy_r = yy[valid]
 
     in_bounds = (xx_r >= 0) & (xx_r < W)
-    xx_r = xx_r[in_bounds]; yy_r = yy_r[in_bounds]
+    xx_r = xx_r[in_bounds]
+    yy_r = yy_r[in_bounds]
     d_vals = depth_left_m[valid][in_bounds]
 
-    np.add.at(depth_right, (yy_r, xx_r), d_vals)
-    np.add.at(weight, (yy_r, xx_r), 1.0)
+    # Keep minimum depth at each target pixel (closest surface wins)
+    np.minimum.at(depth_right, (yy_r, xx_r), d_vals)
 
-    mask = weight > 0
-    depth_right[mask] /= weight[mask]
-
-    # Fill holes via nearest-neighbor inpainting
-    missing = ~mask
-    if missing.any():
+    filled = np.isfinite(depth_right)
+    missing = ~filled
+    if missing.any() and filled.any():
         from scipy.ndimage import distance_transform_edt
-        if mask.any():
-            dist, idx = distance_transform_edt(missing, return_indices=True)
-            depth_right = depth_right[tuple(idx)]
+        dist, idx = distance_transform_edt(missing, return_indices=True)
+        depth_right = depth_right[tuple(idx)]
+    depth_right[~np.isfinite(depth_right)] = 0
 
     return depth_right
 
@@ -266,6 +258,8 @@ def main():
 
     # Load & scale mesh
     mesh = trimesh.load(mesh_file)
+    # Strip texture to prevent deepcopy errors with corrupted/truncated PNGs
+    mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
     diag_before = np.linalg.norm(mesh.vertices.max(axis=0) - mesh.vertices.min(axis=0))
     mesh.vertices = mesh.vertices * mesh_scale
     diag_after = np.linalg.norm(mesh.vertices.max(axis=0) - mesh.vertices.min(axis=0))
