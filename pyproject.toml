@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stereo-hoi"
+version = "0.1.0"
+description = "Stereo hand-object interaction object pose estimation pipeline"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "QingMeng"},
+]
+
+[project.optional-dependencies]
+# Core (always available — pure Python + numpy)
+core = ["numpy>=1.24"]
+
+# Individual pipeline stages
+depth = ["stereo-hoi[core]", "torch", "opencv-python"]
+tracking = ["stereo-hoi[core]", "torch", "trimesh", "imageio", "opencv-python"]
+fusion = ["stereo-hoi[core]"]
+hand = [
+    "stereo-hoi[core]",
+    "torch",
+    "opencv-python",
+    "ultralytics>=8.1",
+]
+vis = [
+    "stereo-hoi[core]",
+    "viser",
+    "trimesh",
+    "opencv-python",
+    "imageio",
+]
+all = [
+    "stereo-hoi[depth,tracking,fusion,hand,vis]",
+]
+
+[project.scripts]
+stereo-hoi = "stereo_hoi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

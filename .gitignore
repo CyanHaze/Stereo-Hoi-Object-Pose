@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project: large data / model artifacts
+data/
+*.mp4
+*.pth
+*.ckpt
+*.pt
+pretrained_models/
+mano_data/
+weights/
+
+# Project: outputs
+track_vis/
+video_frames/
+depth/
+ob_in_cam/
+*.npz
+*.npy
+
+# Conda
+.pixi/
