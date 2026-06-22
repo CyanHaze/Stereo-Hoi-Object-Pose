@@ -21,7 +21,7 @@ venv/
 Thumbs.db
 
 # Project: large data / model artifacts
-data/
+/data/
 *.mp4
 *.pth
 *.ckpt

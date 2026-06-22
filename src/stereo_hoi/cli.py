@@ -13,6 +13,7 @@ Usage::
 """
 
 import argparse
+import json
 import sys
 
 
@@ -178,6 +179,33 @@ def cmd_video(args):
         start_frame=args.start_frame, end_frame=args.end_frame)
 
 
+def cmd_evaluate(args):
+    from pathlib import Path
+
+    from .evaluation import align_pose_directories, evaluate_trajectory
+
+    frame_ids, predicted, ground_truth = align_pose_directories(
+        args.pred_dir, args.gt_dir)
+    report = evaluate_trajectory(
+        predicted,
+        ground_truth,
+        relative_delta=args.relative_delta,
+        failure_translation_m=args.failure_trans,
+        failure_rotation_deg=args.failure_rot,
+    )
+    report["first_frame_id"] = frame_ids[0]
+    report["last_frame_id"] = frame_ids[-1]
+    report["pred_dir"] = str(Path(args.pred_dir).resolve())
+    report["gt_dir"] = str(Path(args.gt_dir).resolve())
+
+    payload = json.dumps(report, indent=2)
+    print(payload)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(payload + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Subcommand builders
 # ---------------------------------------------------------------------------
@@ -271,6 +299,15 @@ def _video_subparser(sub):
     sub.add_argument("--end_frame", type=int, default=-1)
 
 
+def _evaluate_subparser(sub):
+    sub.add_argument("--pred_dir", type=str, required=True)
+    sub.add_argument("--gt_dir", type=str, required=True)
+    sub.add_argument("--relative_delta", type=int, default=1)
+    sub.add_argument("--failure_trans", type=float, default=0.05)
+    sub.add_argument("--failure_rot", type=float, default=30.0)
+    sub.add_argument("--output", type=str, default=None)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -284,6 +321,8 @@ COMMANDS = {
     "viewer": (cmd_viewer, _viewer_subparser, "Launch Viser 3D interactive viewer"),
     "export": (cmd_export, _export_subparser, "Export static web demo assets"),
     "video":  (cmd_video,  _video_subparser,  "Build comparison videos"),
+    "evaluate": (cmd_evaluate, _evaluate_subparser,
+                 "Evaluate a predicted pose sequence against ground truth"),
 }
 
 

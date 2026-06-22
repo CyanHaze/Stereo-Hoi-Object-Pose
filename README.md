@@ -2,6 +2,20 @@
 
 基于双目视频 + 已重建 mesh，估计准确、连续、稳定的物体 6D pose 序列。
 
+![Pipeline](src/pipeline.png)
+
+> Research status: the current implementation is retained as a legacy
+> baseline. The project is being restructured around stereo/multi-view
+> observation-level state estimation, reliability, recovery, and public
+> benchmark evaluation.
+
+Research planning documents:
+
+- [Research direction and RQs](docs/research_direction.md)
+- [Evaluation and benchmark strategy](docs/evaluation_strategy.md)
+- [Related work map](docs/related_work.md)
+- [Project rearchitecture](docs/rearchitecture.md)
+
 **核心思路**：将 AGILE 的 setting 从单目扩展到双目 — 用 Fast-FoundationStereo 获取更可靠的双目深度，用 FoundationPose 在左右视角上独立 tracking，再融合两个视角的结果。
 
 ## 安装
